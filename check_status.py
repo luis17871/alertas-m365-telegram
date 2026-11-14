@@ -8,6 +8,9 @@ de estatus. Sin novedad, no publica nada.
 
 Reglas (pedidas por Luis):
 - Solo alertas de Microsoft 365 y Azure, tono formal, detalladas y graficas.
+- Se envian TODAS las alertas criticas y medias. Al inicio del mensaje va
+  un circulo de color con la severidad: 🔴 critica, 🟡 media,
+  🟢 restablecido / sin incidentes.
 - Todas las horas en hora de Ecuador (UTC-5), etiquetadas.
 - El estado se guarda en state.json; la primera corrida establece la base
   sin publicar, salvo que el estatus o el titulo ya hayan cambiado respecto
@@ -198,20 +201,29 @@ STATUS_LABEL = {
     "restored": "RESTABLECIDO",
     "ok": "SIN INCIDENTES",
 }
-STATUS_ICON = {
-    "degradation": "🟡",
-    "interruption": "🔴",
-    "incident": "🔴",
-    "restored": "🟢",
-    "ok": "🟢",
+# Severidad (pedida por Luis el 14/11/2026): se envian TODAS las alertas
+# criticas y medias. El circulo de color va al inicio del mensaje e indica
+# la severidad: 🔴 critica (interrupcion del servicio / incidencia),
+# 🟡 media (degradacion del servicio), 🟢 restablecido / sin incidentes.
+SEVERITY = {
+    "degradation": ("🟡", "MEDIA"),
+    "interruption": ("🔴", "CRÍTICA"),
+    "incident": ("🔴", "CRÍTICA"),
+    "restored": ("🟢", None),
+    "ok": ("🟢", None),
 }
 
 
 def compose(service, effective_status, info, prev):
     name = "MICROSOFT 365" if service == "m365" else "MICROSOFT AZURE"
     now_ec = datetime.now(ECUADOR).strftime("%H:%M")
+    icon, severity = SEVERITY[effective_status]
+    if severity:
+        headline = f"{icon} ALERTA {severity} — {name} — {STATUS_LABEL[effective_status]}"
+    else:
+        headline = f"{icon} {STATUS_LABEL[effective_status]} — {name}"
     lines = [
-        f"{STATUS_ICON[effective_status]} ALERTA {name} — {STATUS_LABEL[effective_status]}",
+        headline,
         f"🕐 Hora Ecuador: {now_ec} (UTC-5)",
     ]
     ids = ""
