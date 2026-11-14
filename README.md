@@ -9,6 +9,10 @@ alertas al grupo de Telegram **Alertas 365**.
   actualización oficial nueva o cambio de estatus. Sin novedad, no publica nada.
 - Cada alerta es formal, detallada y gráfica, con el estatus marcado y
   **todas las horas en hora de Ecuador (UTC-5)**.
+- Se envían **todas las alertas críticas y medias**. Cada alerta lleva al
+  inicio un círculo de color con su severidad: 🔴 crítica (interrupción
+  del servicio), 🟡 media (degradación del servicio),
+  🟢 restablecido / sin incidentes.
 - El estado ya comunicado se guarda en `state.json`; el flujo lo actualiza
   solo cuando publica una alerta.
 
