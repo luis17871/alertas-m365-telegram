@@ -1,0 +1,53 @@
+name: Alertas Microsoft 365 y Azure a Telegram
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_post:
+        description: 'Enviar un mensaje de prueba al grupo de Telegram'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: m365-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar Playwright y Chromium
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+
+      - name: Revisar estado y alertar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: '-5566320217'
+          TEST_POST: ${{ inputs.test_post }}
+        run: python check_status.py
+
+      - name: Guardar estado
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Actualizar estado de alertas M365/Azure"
+            git push
+          fi
