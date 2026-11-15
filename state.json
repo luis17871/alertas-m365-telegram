@@ -4,11 +4,12 @@
     "last_update_ec": null,
     "last_update_text": "",
     "last_update_utc": null,
-    "status": "incident",
-    "title": "Microsoft Azure Go to Azure Service Health To see detailed service health information, go to Azure Service Health. RSS",
+    "status": "ok",
+    "title": "",
     "next_update_ec": null,
     "details_hash": "725c45260c660326bd5ae42b2a5091fa635c6e1ad7cff9331585eba5f47bd045",
-    "excerpt": "Microsoft Azure Go to Azure Service Health To see detailed service health information, go to Azure Service Health. RSS"
+    "excerpt": "Microsoft Azure Go to Azure Service Health To see detailed service health information, go to Azure Service Health. RSS",
+    "last_alert_epoch": 1794729219
   },
   "m365": {
     "incident_ids": "EX1550543 / MO1550821",
