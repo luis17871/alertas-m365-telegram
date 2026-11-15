@@ -1,1 +1,24 @@
-{"azure":{"incident_ids":"","last_update_ec":null,"last_update_text":"","last_update_utc":null,"status":"ok","title":""},"m365":{"incident_ids":"EX1550543 / MO1550821","last_update_ec":"17:00","last_update_text":"Sustained service recovery across the affected environments; monitoring continues and the delayed-mail queue is draining.","last_update_utc":"2026-11-13T22:00:36Z","status":"degradation","title":"Users may be unable to connect to multiple Microsoft 365 services"}}
+{
+  "azure": {
+    "incident_ids": "",
+    "last_update_ec": null,
+    "last_update_text": "",
+    "last_update_utc": null,
+    "status": "incident",
+    "title": "Microsoft Azure Go to Azure Service Health To see detailed service health information, go to Azure Service Health. RSS",
+    "next_update_ec": null,
+    "details_hash": "725c45260c660326bd5ae42b2a5091fa635c6e1ad7cff9331585eba5f47bd045",
+    "excerpt": "Microsoft Azure Go to Azure Service Health To see detailed service health information, go to Azure Service Health. RSS"
+  },
+  "m365": {
+    "incident_ids": "EX1550543 / MO1550821",
+    "last_update_ec": null,
+    "last_update_text": "Sustained service recovery across the affected environments; monitoring continues and the delayed-mail queue is draining.",
+    "last_update_utc": "2026-11-13T22:00:36Z",
+    "status": "ok",
+    "title": "",
+    "next_update_ec": null,
+    "details_hash": "e503532440eb31737df6ecc2837c925c9a8fb6a8b0bf89e6202fc42622a1633e",
+    "excerpt": "Microsoft 365 (Business or Enterprise) Check status in the admin center RSS"
+  }
+}
