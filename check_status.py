@@ -2,9 +2,12 @@
 """Monitoreo de incidencias de Microsoft 365 y Azure con alertas a Telegram.
 
 Lee la pagina oficial https://status.cloud.microsoft/ con un navegador
-headless (la pagina es JavaScript) y publica en el grupo de Telegram solo
-cuando hay un incidente nuevo, una actualizacion oficial nueva o un cambio
-de estatus. Sin novedad, no publica nada.
+headless (la pagina es JavaScript) y publica en el grupo de Telegram cuando:
+  - aparece un incidente nuevo o cambia (nuevo estado / titulo),
+  - un incidente activo SIGUE activo (recordatorio periodico, cada
+    RECORDAR_MIN minutos; por defecto 60),
+  - un incidente se restablece (pasa a sin incidentes).
+Sin novedad y sin recordatorio pendiente, no publica nada.
 
 Reglas (pedidas por Luis):
 - Solo alertas de Microsoft 365 y Azure, tono formal, detalladas y graficas.
@@ -16,10 +19,17 @@ Reglas (pedidas por Luis):
   sin publicar, salvo que el estatus o el titulo ya hayan cambiado respecto
   a la semilla (en ese caso si publica).
 
+Deteccion (corregida 14/11/2026): el estado por defecto es "sin incidentes".
+Solo se marca incidente cuando la pagina muestra los banners oficiales
+"Service interruption" o "Service degradation". El texto de ayuda fijo del
+panel de Azure ("Go to Azure Service Health... RSS") ya NO se confunde con un
+incidente.
+
 Variables de entorno:
 - TELEGRAM_BOT_TOKEN (secreto del repositorio)
 - TELEGRAM_CHAT_ID (por defecto -5566320217, grupo "Alertas 365")
 - TEST_POST=true: envia un mensaje de prueba sin tocar state.json
+- RECORDAR_MIN: minutos entre recordatorios de un incidente activo (def. 60)
 """
 
 import hashlib
@@ -41,6 +51,9 @@ ECUADOR = ZoneInfo("America/Guayaquil")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-5566320217")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TEST_POST = os.environ.get("TEST_POST", "false").lower() == "true"
+RECORDAR_MIN = int(os.environ.get("RECORDAR_MIN", "60"))
+
+ACTIVE_STATUSES = ("interruption", "degradation", "incident")
 
 MONTHS = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
@@ -153,6 +166,34 @@ def find_next_update(text):
     return to_ecuador(times[0]) if times else None
 
 
+def detect_status(text):
+    """Estado del servicio a partir de los banners oficiales.
+
+    Por defecto 'ok'. Solo marca incidente con las frases oficiales
+    'Service interruption' / 'Service degradation'. El texto de ayuda fijo
+    del panel (enlaces a Service Health, RSS) nunca cuenta como incidente.
+    """
+    if "Service interruption" in text:
+        return "interruption"
+    if "Service degradation" in text:
+        return "degradation"
+    return "ok"
+
+
+def extract_title(text, status):
+    """Descripcion corta del incidente; vacio si esta sano o es boilerplate."""
+    if status == "ok":
+        return ""
+    m = re.search(r"Users may (?:be unable to|be experiencing|experience)[^.]*", text)
+    if not m:
+        return ""
+    title = clean(m.group(0))
+    # Evita capturar el texto de ayuda del panel.
+    if "Service Health" in title or "RSS" in title:
+        return ""
+    return title
+
+
 def parse_service(body, service):
     if service == "m365":
         text = section(
@@ -163,23 +204,8 @@ def parse_service(body, service):
     else:
         text = section(body, "Microsoft Azure", ["Power Platform Admin Center"])
     text = clean(text)
-    if service == "m365":
-        if "Service interruption" in text:
-            status = "interruption"
-        elif "Service degradation" in text or "Users may be unable to connect" in text:
-            status = "degradation"
-        else:
-            status = "ok"
-        m = re.search(r"Users may be unable to [^.]*", text)
-        title = clean(m.group(0)) if m else ""
-    else:
-        if "No Azure issues detected" in text:
-            status = "ok"
-            title = ""
-        else:
-            status = "incident"
-            m = re.search(r"Users may be (?:unable|experiencing)[^.]*", text)
-            title = clean(m.group(0)) if m else clean(text[:200])
+    status = detect_status(text)
+    title = extract_title(text, status)
     times = parse_utc_times(text)
     last_update = to_ecuador(times[0]) if times else None
     next_update = find_next_update(text)
@@ -214,11 +240,15 @@ SEVERITY = {
 }
 
 
-def compose(service, effective_status, info, prev):
+def compose(service, effective_status, info, prev, reminder=False):
     name = "MICROSOFT 365" if service == "m365" else "MICROSOFT AZURE"
     now_ec = datetime.now(ECUADOR).strftime("%H:%M")
     icon, severity = SEVERITY[effective_status]
-    if severity:
+    if reminder and severity:
+        headline = (
+            f"{icon} EL INCIDENTE CONTINÚA — {name} — {STATUS_LABEL[effective_status]}"
+        )
+    elif severity:
         headline = f"{icon} ALERTA {severity} — {name} — {STATUS_LABEL[effective_status]}"
     else:
         headline = f"{icon} {STATUS_LABEL[effective_status]} — {name}"
@@ -245,6 +275,38 @@ def compose(service, effective_status, info, prev):
     )
     lines.append("🔗 Fuente: https://status.cloud.microsoft/")
     return "\n".join(lines)
+
+
+def decide(info, prev, now_epoch):
+    """Decide la accion para un servicio.
+
+    Devuelve (accion, effective, reminder):
+      accion   : 'base' (fija base sin publicar), 'send' o 'none'
+      effective: estado a mostrar ('restored' si se restablecio)
+      reminder : True si es recordatorio de incidente que continua
+    """
+    baseline = "details_hash" not in prev
+    status_changed = info["status"] != prev.get("status")
+    title_changed = info["title"] != prev.get("title", "")
+    active = info["status"] in ACTIVE_STATUSES
+
+    if baseline and not status_changed and not title_changed:
+        return "base", info["status"], False
+
+    # Cambio real de estado o de titulo -> publicar.
+    if status_changed or title_changed:
+        effective = info["status"]
+        if prev.get("status") in ACTIVE_STATUSES and info["status"] == "ok":
+            effective = "restored"
+        return "send", effective, False
+
+    # Sin cambios, pero sigue activo: recordatorio periodico.
+    if active:
+        last = prev.get("last_alert_epoch", 0)
+        if now_epoch - last >= RECORDAR_MIN * 60:
+            return "send", info["status"], True
+
+    return "none", info["status"], False
 
 
 def send_telegram(text):
@@ -280,35 +342,41 @@ def main():
         return 0
 
     body = fetch_status_page()
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
     changed = False
     for service in ("m365", "azure"):
         info = parse_service(body, service)
         prev = state.get(service, {})
-        baseline = "details_hash" not in prev
-        status_changed = info["status"] != prev.get("status")
-        title_changed = info["title"] != prev.get("title", "")
-        details_changed = (not baseline) and info["details_hash"] != prev.get("details_hash")
-        if baseline and not status_changed and not title_changed:
+        action, effective, reminder = decide(info, prev, now_epoch)
+
+        if action == "base":
             print(f"{service}: base inicial establecida, sin publicar.")
             state[service] = {**prev, **info}
             changed = True
             continue
-        if status_changed or title_changed or details_changed:
-            effective = info["status"]
-            if prev.get("status") in ("degradation", "interruption", "incident") and info["status"] == "ok":
-                effective = "restored"
-            message = compose(service, effective, info, prev)
-            print(f"{service}: novedad detectada, publicando alerta.")
+
+        if action == "send":
+            message = compose(service, effective, info, prev, reminder=reminder)
+            tag = "recordatorio" if reminder else "novedad"
+            print(f"{service}: {tag} detectada, publicando alerta.")
             print(message)
             send_telegram(message)
             stored = {**prev, **info}
             stored["status"] = info["status"]
+            stored["last_alert_epoch"] = now_epoch
             if effective == "restored":
                 stored["title"] = ""
             state[service] = stored
             changed = True
         else:
             print(f"{service}: sin novedad.")
+            # Mantiene hash/estado al dia sin publicar.
+            merged = {**prev, **info}
+            merged["status"] = info["status"]
+            if merged != prev:
+                state[service] = merged
+                changed = True
+
     if changed:
         save_state(state)
         print("state.json actualizado.")
