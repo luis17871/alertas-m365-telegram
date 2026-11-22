@@ -32,7 +32,7 @@ jobs:
 
       - name: Instalar Playwright y Chromium
         run: |
-          pip install playwright requests
+          pip install playwright requests feedparser
           playwright install chromium --with-deps
 
       - name: Revisar estado y alertar
@@ -40,6 +40,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: '-5566320217'
           TEST_POST: ${{ inputs.test_post }}
+          # Minutos entre recordatorios de un incidente activo (opcional).
+          RECORDAR_MIN: '60'
+          # Microsoft Graph (opcional): se activan al cargar estos secretos.
+          # Requiere app en Entra con ServiceHealth.Read.All y ServiceMessage.Read.All.
+          GRAPH_TENANT_ID: ${{ secrets.GRAPH_TENANT_ID }}
+          GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
+          GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
         run: python check_status.py
 
       - name: Guardar estado

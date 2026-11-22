@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
 """Monitoreo de incidencias de Microsoft 365 y Azure con alertas a Telegram.
 
-Lee la pagina oficial https://status.cloud.microsoft/ con un navegador
-headless (la pagina es JavaScript) y publica en el grupo de Telegram cuando:
-  - aparece un incidente nuevo o cambia (nuevo estado / titulo),
-  - un incidente activo SIGUE activo (recordatorio periodico, cada
-    RECORDAR_MIN minutos; por defecto 60),
-  - un incidente se restablece (pasa a sin incidentes).
-Sin novedad y sin recordatorio pendiente, no publica nada.
+Fuentes (cada alerta se cataloga por CATEGORIA y SEVERIDAD):
 
-Reglas (pedidas por Luis):
-- Solo alertas de Microsoft 365 y Azure, tono formal, detalladas y graficas.
-- Se envian TODAS las alertas criticas y medias. Al inicio del mensaje va
-  un circulo de color con la severidad: 🔴 critica, 🟡 media,
-  🟢 restablecido / sin incidentes.
-- Todas las horas en hora de Ecuador (UTC-5), etiquetadas.
-- El estado se guarda en state.json; la primera corrida establece la base
-  sin publicar, salvo que el estatus o el titulo ya hayan cambiado respecto
-  a la semilla (en ese caso si publica).
+1) Pagina oficial https://status.cloud.microsoft/ (scraping headless). Mantiene
+   el estado actual de Microsoft 365 y Azure como maquina de estados:
+   alerta al aparecer, recordatorio "EL INCIDENTE CONTINUA" cada RECORDAR_MIN
+   minutos mientras siga, y "RESTABLECIDO" al resolverse.
 
-Deteccion (corregida 14/11/2026): el estado por defecto es "sin incidentes".
-Solo se marca incidente cuando la pagina muestra los banners oficiales
-"Service interruption" o "Service degradation". El texto de ayuda fijo del
-panel de Azure ("Go to Azure Service Health... RSS") ya NO se confunde con un
-incidente.
+2) RSS oficial de Azure Status  -> capta caidas publicas de Azure que la pagina
+   agregada a veces no refleja.
+
+3) RSS del Centro de mensajes/estado de Microsoft 365 (admin center).
+
+4) (Opcional, se activa solo con credenciales) Microsoft Graph Service
+   Communications API -> incidentes de TU tenant y avisos del Centro de
+   mensajes / seguridad (p.ej. una brecha tipo Entra Connect Health). Requiere
+   registrar una app en Entra con permisos de aplicacion ServiceHealth.Read.All
+   y ServiceMessage.Read.All, y cargar GRAPH_TENANT_ID / GRAPH_CLIENT_ID /
+   GRAPH_CLIENT_SECRET como secretos del repositorio. Sin esas variables, este
+   bloque no se ejecuta.
+
+Catalogacion:
+- Categoria: 🔧 Servicio  |  🔐 Seguridad
+- Severidad: 🔴 critica  |  🟡 media  |  🟢 restablecido  |  ℹ️ informativa
+
+Reglas (pedidas por Luis): solo Microsoft 365 y Azure, tono formal, horas en
+hora de Ecuador (UTC-5) etiquetadas, se envian todas las alertas criticas y
+medias. Cada fuente de eventos (RSS/Graph) deduplica por id para no repetir.
 
 Variables de entorno:
 - TELEGRAM_BOT_TOKEN (secreto del repositorio)
 - TELEGRAM_CHAT_ID (por defecto -5566320217, grupo "Alertas 365")
 - TEST_POST=true: envia un mensaje de prueba sin tocar state.json
-- RECORDAR_MIN: minutos entre recordatorios de un incidente activo (def. 60)
+- RECORDAR_MIN: minutos entre recordatorios de incidente activo (def. 60)
+- GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET: activan el bloque 4
 """
 
 import hashlib
@@ -43,7 +48,22 @@ from zoneinfo import ZoneInfo
 import requests
 from playwright.sync_api import sync_playwright
 
+try:
+    import feedparser
+except Exception:  # noqa: BLE001
+    feedparser = None
+
 STATUS_URL = "https://status.cloud.microsoft/"
+# RSS oficiales (verificados nov-2026). Se intentan en orden hasta que uno responda.
+AZURE_RSS = [
+    "https://rssfeed.azure.status.microsoft/en-us/status/feed/",
+    "https://azure.status.microsoft/en-us/status/feed/",
+    "https://azure.microsoft.com/en-us/status/feed/",
+]
+M365_RSS = [
+    "https://status.cloud.microsoft/api/feed/mac",
+]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 ECUADOR = ZoneInfo("America/Guayaquil")
@@ -53,7 +73,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TEST_POST = os.environ.get("TEST_POST", "false").lower() == "true"
 RECORDAR_MIN = int(os.environ.get("RECORDAR_MIN", "60"))
 
+GRAPH_TENANT_ID = os.environ.get("GRAPH_TENANT_ID", "")
+GRAPH_CLIENT_ID = os.environ.get("GRAPH_CLIENT_ID", "")
+GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", "")
+
 ACTIVE_STATUSES = ("interruption", "degradation", "incident")
+SEEN_MAX = 300  # ids recordados para no repetir alertas de eventos (RSS/Graph)
 
 MONTHS = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
@@ -61,10 +86,38 @@ MONTHS = {
     "December": 12,
 }
 
+STATUS_LABEL = {
+    "degradation": "DEGRADACIÓN DEL SERVICIO",
+    "interruption": "INTERRUPCIÓN DEL SERVICIO",
+    "incident": "INCIDENCIA ACTIVA",
+    "restored": "RESTABLECIDO",
+    "ok": "SIN INCIDENTES",
+    "info": "AVISO",
+}
+# 🔴 critica (interrupcion/incidencia), 🟡 media (degradacion),
+# 🟢 restablecido/sin incidentes, ℹ️ informativa.
+SEVERITY = {
+    "degradation": ("🟡", "MEDIA"),
+    "interruption": ("🔴", "CRÍTICA"),
+    "incident": ("🔴", "CRÍTICA"),
+    "restored": ("🟢", None),
+    "ok": ("🟢", None),
+    "info": ("ℹ️", "INFORMATIVA"),
+}
+CATEGORY_LABEL = {
+    "servicio": "🔧 Servicio",
+    "seguridad": "🔐 Seguridad",
+}
+
 
 def load_state():
-    with open(STATE_FILE, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data.setdefault("seen", [])
+    return data
 
 
 def save_state(state):
@@ -77,8 +130,15 @@ def clean(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def now_ec():
+    return datetime.now(ECUADOR).strftime("%H:%M")
+
+
+# --------------------------------------------------------------------------- #
+# Fuente 1: scraping de la pagina oficial (maquina de estados)                 #
+# --------------------------------------------------------------------------- #
+
 def fetch_status_page():
-    """Devuelve el texto visible de la pagina oficial de estado."""
     last_error = None
     for attempt in range(2):
         try:
@@ -94,11 +154,11 @@ def fetch_status_page():
                         btn.click(timeout=5000)
                         page.wait_for_timeout(3000)
                 except Exception:
-                    pass  # sin detalles expandidos igual se lee el estado
+                    pass
                 body = page.inner_text("body")
                 browser.close()
                 return body
-        except Exception as exc:  # noqa: BLE001 - reintento simple
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             print(f"Intento {attempt + 1} fallido: {exc}", flush=True)
     raise RuntimeError(f"No se pudo leer la pagina oficial: {last_error}")
@@ -117,7 +177,6 @@ def section(body, start, ends):
 
 
 def parse_utc_times(text):
-    """Extrae horas en UTC del texto y las devuelve como datetimes UTC."""
     found = []
     pattern = re.compile(
         r"(?:(January|February|March|April|May|June|July|August|September|"
@@ -151,15 +210,9 @@ def to_ecuador(dt_utc):
 
 
 def find_next_update(text):
-    m = re.search(
-        r"[Nn]ext update[^.]{0,120}?(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*UTC)",
-        text,
-    )
+    m = re.search(r"[Nn]ext update[^.]{0,120}?(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*UTC)", text)
     if not m:
-        m = re.search(
-            r"[Uu]pdate by[^.]{0,120}?(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*UTC)",
-            text,
-        )
+        m = re.search(r"[Uu]pdate by[^.]{0,120}?(\d{1,2}:\d{2}\s*(?:AM|PM)?\s*UTC)", text)
     if not m:
         return None
     times = parse_utc_times(m.group(0))
@@ -167,12 +220,6 @@ def find_next_update(text):
 
 
 def detect_status(text):
-    """Estado del servicio a partir de los banners oficiales.
-
-    Por defecto 'ok'. Solo marca incidente con las frases oficiales
-    'Service interruption' / 'Service degradation'. El texto de ayuda fijo
-    del panel (enlaces a Service Health, RSS) nunca cuenta como incidente.
-    """
     if "Service interruption" in text:
         return "interruption"
     if "Service degradation" in text:
@@ -181,14 +228,12 @@ def detect_status(text):
 
 
 def extract_title(text, status):
-    """Descripcion corta del incidente; vacio si esta sano o es boilerplate."""
     if status == "ok":
         return ""
     m = re.search(r"Users may (?:be unable to|be experiencing|experience)[^.]*", text)
     if not m:
         return ""
     title = clean(m.group(0))
-    # Evita capturar el texto de ayuda del panel.
     if "Service Health" in title or "RSS" in title:
         return ""
     return title
@@ -220,162 +265,306 @@ def parse_service(body, service):
     }
 
 
-STATUS_LABEL = {
-    "degradation": "DEGRADACIÓN DEL SERVICIO",
-    "interruption": "INTERRUPCIÓN DEL SERVICIO",
-    "incident": "INCIDENCIA ACTIVA",
-    "restored": "RESTABLECIDO",
-    "ok": "SIN INCIDENTES",
-}
-# Severidad (pedida por Luis el 14/11/2026): se envian TODAS las alertas
-# criticas y medias. El circulo de color va al inicio del mensaje e indica
-# la severidad: 🔴 critica (interrupcion del servicio / incidencia),
-# 🟡 media (degradacion del servicio), 🟢 restablecido / sin incidentes.
-SEVERITY = {
-    "degradation": ("🟡", "MEDIA"),
-    "interruption": ("🔴", "CRÍTICA"),
-    "incident": ("🔴", "CRÍTICA"),
-    "restored": ("🟢", None),
-    "ok": ("🟢", None),
-}
-
-
-def compose(service, effective_status, info, prev, reminder=False):
+def compose(service, effective_status, info, prev, reminder=False, category="servicio"):
     name = "MICROSOFT 365" if service == "m365" else "MICROSOFT AZURE"
-    now_ec = datetime.now(ECUADOR).strftime("%H:%M")
     icon, severity = SEVERITY[effective_status]
     if reminder and severity:
-        headline = (
-            f"{icon} EL INCIDENTE CONTINÚA — {name} — {STATUS_LABEL[effective_status]}"
-        )
+        headline = f"{icon} EL INCIDENTE CONTINÚA — {name} — {STATUS_LABEL[effective_status]}"
     elif severity:
         headline = f"{icon} ALERTA {severity} — {name} — {STATUS_LABEL[effective_status]}"
     else:
         headline = f"{icon} {STATUS_LABEL[effective_status]} — {name}"
     lines = [
         headline,
-        f"🕐 Hora Ecuador: {now_ec} (UTC-5)",
+        f"🏷 Categoría: {CATEGORY_LABEL[category]}",
+        f"🕐 Hora Ecuador: {now_ec()} (UTC-5)",
     ]
-    ids = ""
-    if prev.get("title") and prev.get("title") == info["title"]:
-        ids = prev.get("incident_ids", "")
-    if ids:
-        lines.append(f"📌 Incidente: {ids}")
     lines.append(f"📋 Corresponde a: {info['title'] or 'revise el detalle en la página oficial.'}")
     if info["last_update_ec"]:
         summary = info["excerpt"][:300]
-        lines.append(
-            f"🕔 Última actualización oficial: {info['last_update_ec']} hora Ecuador (UTC-5) — {summary}"
-        )
+        lines.append(f"🕔 Última actualización oficial: {info['last_update_ec']} hora Ecuador (UTC-5) — {summary}")
     else:
         lines.append("🕔 Última actualización oficial: ver detalle en la página oficial.")
-    lines.append(
-        f"⏭ Próxima actualización prevista: "
-        f"{info['next_update_ec'] + ' hora Ecuador (UTC-5)' if info['next_update_ec'] else 'no indicada'}"
-    )
+    nxt = info["next_update_ec"]
+    lines.append(f"⏭ Próxima actualización prevista: {nxt + ' hora Ecuador (UTC-5)' if nxt else 'no indicada'}")
     lines.append("🔗 Fuente: https://status.cloud.microsoft/")
     return "\n".join(lines)
 
 
 def decide(info, prev, now_epoch):
-    """Decide la accion para un servicio.
-
-    Devuelve (accion, effective, reminder):
-      accion   : 'base' (fija base sin publicar), 'send' o 'none'
-      effective: estado a mostrar ('restored' si se restablecio)
-      reminder : True si es recordatorio de incidente que continua
-    """
     baseline = "details_hash" not in prev
     status_changed = info["status"] != prev.get("status")
     title_changed = info["title"] != prev.get("title", "")
     active = info["status"] in ACTIVE_STATUSES
-
     if baseline and not status_changed and not title_changed:
         return "base", info["status"], False
-
-    # Cambio real de estado o de titulo -> publicar.
     if status_changed or title_changed:
         effective = info["status"]
         if prev.get("status") in ACTIVE_STATUSES and info["status"] == "ok":
             effective = "restored"
         return "send", effective, False
-
-    # Sin cambios, pero sigue activo: recordatorio periodico.
     if active:
         last = prev.get("last_alert_epoch", 0)
         if now_epoch - last >= RECORDAR_MIN * 60:
             return "send", info["status"], True
-
     return "none", info["status"], False
 
+
+# --------------------------------------------------------------------------- #
+# Fuentes 2 y 3: feeds RSS                                                     #
+# --------------------------------------------------------------------------- #
+
+def classify_event(title, summary):
+    """Devuelve (severidad, categoria) a partir del texto de un item de feed."""
+    t = f"{title} {summary}".lower()
+    category = "seguridad" if any(k in t for k in (
+        "security", "breach", "vulnerab", "advisory", "compromis", "exposed", "exploit",
+    )) else "servicio"
+    if any(k in t for k in ("resolved", "mitigated", "post incident", "pir ", "recovered",
+                            "has been restored", "restored", "healthy")):
+        return "restored", category
+    if any(k in t for k in ("interruption", "unavailable", "outage", " down", "not able",
+                            "unable to", "failure", "failing", "error rate")):
+        return "interruption", category
+    if any(k in t for k in ("degrad", "latency", "intermittent", "slow", "delays", "impacted",
+                            "investigating", "experiencing")):
+        return "degradation", category
+    return "info", category
+
+
+def fetch_feed(urls):
+    """Primer feed de la lista que responda; devuelve objeto feedparser o None."""
+    if feedparser is None:
+        print("feedparser no disponible; se omiten los feeds RSS.", flush=True)
+        return None
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=30, headers={"User-Agent": "alertas-m365"})
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
+            if parsed.entries:
+                return parsed
+            print(f"Feed sin entradas: {url}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Feed fallido {url}: {exc}", flush=True)
+    return None
+
+
+def entry_id(entry):
+    raw = entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title", "")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def entry_time_ec(entry):
+    tm = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not tm:
+        return None
+    dt = datetime(*tm[:6], tzinfo=timezone.utc)
+    return dt.astimezone(ECUADOR).strftime("%Y-%m-%d %H:%M")
+
+
+def compose_feed(name, severity, category, title, summary, link, when_ec):
+    icon, sev = SEVERITY[severity]
+    if sev:
+        headline = f"{icon} ALERTA {sev} — {name} — {STATUS_LABEL[severity]}"
+    else:
+        headline = f"{icon} {STATUS_LABEL[severity]} — {name}"
+    lines = [
+        headline,
+        f"🏷 Categoría: {CATEGORY_LABEL[category]}",
+        f"🕐 Hora Ecuador: {now_ec()} (UTC-5)",
+        f"📋 {clean(title)}",
+    ]
+    if summary:
+        lines.append(f"📝 {clean(summary)[:300]}")
+    if when_ec:
+        lines.append(f"🕔 Publicado: {when_ec} hora Ecuador (UTC-5)")
+    lines.append(f"🔗 Fuente: {link}")
+    return "\n".join(lines)
+
+
+def process_feed(urls, name, state, send):
+    parsed = fetch_feed(urls)
+    if not parsed:
+        return
+    seen = state["seen"]
+    # Procesa de mas antiguo a mas nuevo para respetar el orden cronologico.
+    for entry in reversed(parsed.entries[:30]):
+        eid = entry_id(entry)
+        if eid in seen:
+            continue
+        title = entry.get("title", "")
+        summary = entry.get("summary", "") or entry.get("description", "")
+        link = entry.get("link", "") or urls[0]
+        severity, category = classify_event(title, summary)
+        when_ec = entry_time_ec(entry)
+        msg = compose_feed(name, severity, category, title, summary, link, when_ec)
+        print(f"{name} [feed]: nuevo item, publicando. ({severity}/{category})")
+        send(msg)
+        seen.append(eid)
+    # Limita el tamano del historial de ids.
+    if len(seen) > SEEN_MAX:
+        del seen[:-SEEN_MAX]
+
+
+# --------------------------------------------------------------------------- #
+# Fuente 4 (opcional): Microsoft Graph Service Communications API              #
+# --------------------------------------------------------------------------- #
+
+def graph_enabled():
+    return bool(GRAPH_TENANT_ID and GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET)
+
+
+def graph_token():
+    url = f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": GRAPH_CLIENT_ID,
+        "client_secret": GRAPH_CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+    r = requests.post(url, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def process_graph(state, send):
+    """Incidentes de servicio y avisos del Centro de mensajes del tenant.
+
+    Se activa solo si estan GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET. Requiere
+    permisos de aplicacion ServiceHealth.Read.All y ServiceMessage.Read.All.
+    """
+    if not graph_enabled():
+        return
+    try:
+        token = graph_token()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Graph: no se pudo obtener token: {exc}", flush=True)
+        return
+    headers = {"Authorization": f"Bearer {token}"}
+    seen = state["seen"]
+    endpoints = [
+        # (url, nombre, categoria por defecto)
+        ("https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/issues", "MICROSOFT 365 / AZURE", "servicio"),
+        ("https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages", "CENTRO DE MENSAJES", "seguridad"),
+    ]
+    for url, name, default_cat in endpoints:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            items = r.json().get("value", [])
+        except Exception as exc:  # noqa: BLE001
+            print(f"Graph {url}: {exc}", flush=True)
+            continue
+        for item in items[:30]:
+            gid = "graph:" + str(item.get("id", ""))
+            key = hashlib.sha256(gid.encode("utf-8")).hexdigest()[:16]
+            if key in seen:
+                continue
+            title = item.get("title", "")
+            body = item.get("body", {}).get("content", "") if isinstance(item.get("body"), dict) else ""
+            summary = clean(re.sub(r"<[^>]+>", " ", body))
+            status = item.get("status", "")
+            severity, category = classify_event(title + " " + status, summary)
+            if default_cat == "seguridad":
+                category = "seguridad"
+            link = item.get("webUrl", "https://admin.microsoft.com/")
+            msg = compose_feed(name, severity, category, title, summary, link, None)
+            print(f"Graph [{name}]: nuevo item {gid} ({severity}/{category})")
+            send(msg)
+            seen.append(key)
+    if len(seen) > SEEN_MAX:
+        del seen[:-SEEN_MAX]
+
+
+# --------------------------------------------------------------------------- #
+# Telegram                                                                     #
+# --------------------------------------------------------------------------- #
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: falta el secreto TELEGRAM_BOT_TOKEN en el repositorio.", file=sys.stderr)
         sys.exit(1)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-        timeout=30,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError:
+        # No exponer la URL (contiene el token) en los logs publicos de Actions.
+        raise RuntimeError(f"Telegram respondió HTTP {resp.status_code} al enviar el mensaje.")
     data = resp.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram devolvió un error: {data}")
+        raise RuntimeError(f"Telegram devolvió error: {data.get('description', data)}")
     print(f"Mensaje enviado a Telegram (message_id {data['result']['message_id']}).")
     return data
 
 
+# --------------------------------------------------------------------------- #
+# Main                                                                         #
+# --------------------------------------------------------------------------- #
+
 def main():
     state = load_state()
+
     if TEST_POST:
-        now_ec = datetime.now(ECUADOR).strftime("%H:%M")
         send_telegram(
             "🔧 PRUEBA DEL MONITOREO — MICROSOFT 365 / AZURE\n"
-            f"🕐 Hora Ecuador: {now_ec} (UTC-5)\n"
-            "Este es un mensaje de prueba del monitoreo automático "
-            "(GitHub Actions). Las alertas reales llegan solo cuando hay "
-            "una novedad en Microsoft 365 o Azure."
+            f"🕐 Hora Ecuador: {now_ec()} (UTC-5)\n"
+            "Mensaje de prueba del monitoreo automático (GitHub Actions). "
+            "Fuentes: página oficial, RSS de Azure Status, RSS de M365 admin "
+            "center" + (" y Microsoft Graph (tenant)" if graph_enabled() else "") + ". "
+            "Las alertas reales llegan solo cuando hay una novedad."
         )
         print("Prueba enviada. state.json no se modificó.")
         return 0
 
-    body = fetch_status_page()
-    now_epoch = int(datetime.now(timezone.utc).timestamp())
     changed = False
-    for service in ("m365", "azure"):
-        info = parse_service(body, service)
-        prev = state.get(service, {})
-        action, effective, reminder = decide(info, prev, now_epoch)
 
-        if action == "base":
-            print(f"{service}: base inicial establecida, sin publicar.")
-            state[service] = {**prev, **info}
-            changed = True
-            continue
-
-        if action == "send":
-            message = compose(service, effective, info, prev, reminder=reminder)
-            tag = "recordatorio" if reminder else "novedad"
-            print(f"{service}: {tag} detectada, publicando alerta.")
-            print(message)
-            send_telegram(message)
-            stored = {**prev, **info}
-            stored["status"] = info["status"]
-            stored["last_alert_epoch"] = now_epoch
-            if effective == "restored":
-                stored["title"] = ""
-            state[service] = stored
-            changed = True
-        else:
-            print(f"{service}: sin novedad.")
-            # Mantiene hash/estado al dia sin publicar.
-            merged = {**prev, **info}
-            merged["status"] = info["status"]
-            if merged != prev:
-                state[service] = merged
+    # Fuente 1: pagina oficial (maquina de estados). No es fatal si falla.
+    try:
+        body = fetch_status_page()
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+        for service in ("m365", "azure"):
+            info = parse_service(body, service)
+            prev = state.get(service, {})
+            action, effective, reminder = decide(info, prev, now_epoch)
+            if action == "base":
+                print(f"{service}: base inicial establecida, sin publicar.")
+                state[service] = {**prev, **info}
                 changed = True
+                continue
+            if action == "send":
+                msg = compose(service, effective, info, prev, reminder=reminder, category="servicio")
+                print(f"{service}: {'recordatorio' if reminder else 'novedad'} detectada, publicando.")
+                send_telegram(msg)
+                stored = {**prev, **info}
+                stored["status"] = info["status"]
+                stored["last_alert_epoch"] = now_epoch
+                if effective == "restored":
+                    stored["title"] = ""
+                state[service] = stored
+                changed = True
+            else:
+                print(f"{service}: sin novedad.")
+                merged = {**prev, **info}
+                merged["status"] = info["status"]
+                if merged != prev:
+                    state[service] = merged
+                    changed = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"Fuente pagina oficial fallida (se continua con los feeds): {exc}", flush=True)
+
+    before = len(state["seen"])
+
+    # Fuentes 2 y 3: feeds RSS.
+    process_feed(AZURE_RSS, "MICROSOFT AZURE", state, send_telegram)
+    process_feed(M365_RSS, "MICROSOFT 365", state, send_telegram)
+
+    # Fuente 4: Graph (solo si hay credenciales).
+    process_graph(state, send_telegram)
+
+    if len(state["seen"]) != before:
+        changed = True
 
     if changed:
         save_state(state)
