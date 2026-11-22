@@ -367,14 +367,33 @@ def fetch_feed(urls):
     if feedparser is None:
         print("feedparser no disponible; se omiten los feeds RSS.", flush=True)
         return None
+    # Navegadores reales reciben el feed; un User-Agent tipo navegador evita
+    # respuestas vacias o HTML de algunos CDN de Microsoft.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    }
     for url in urls:
         try:
-            resp = requests.get(url, timeout=30, headers={"User-Agent": "alertas-m365"})
-            resp.raise_for_status()
+            resp = requests.get(url, timeout=30, headers=headers)
+            status = resp.status_code
+            ctype = resp.headers.get("content-type", "")
             parsed = feedparser.parse(resp.content)
+            feed_title = parsed.feed.get("title", "") if getattr(parsed, "feed", None) else ""
+            print(
+                f"Feed {url}: HTTP {status}, {len(resp.content)} bytes, "
+                f"ctype={ctype!r}, version={getattr(parsed, 'version', '')!r}, "
+                f"bozo={getattr(parsed, 'bozo', '')}, entradas={len(parsed.entries)}, "
+                f"title={feed_title!r}",
+                flush=True,
+            )
+            resp.raise_for_status()
             if parsed.entries:
                 return parsed
-            print(f"Feed sin entradas: {url}", flush=True)
+            # Feed valido pero vacio (sin incidente activo): no probar mas URLs.
+            if feed_title or getattr(parsed, "version", ""):
+                return None
         except Exception as exc:  # noqa: BLE001
             print(f"Feed fallido {url}: {exc}", flush=True)
     return None
