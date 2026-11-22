@@ -130,8 +130,37 @@ def clean(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def strip_html(text):
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text or "")
+    return clean(re.sub(r"<[^>]+>", " ", text))
+
+
 def now_ec():
     return datetime.now(ECUADOR).strftime("%H:%M")
+
+
+def fetch_page_text(url, limit=700):
+    """Lee la pagina publica del incidente y devuelve un resumen legible.
+
+    Prefiere la meta-descripcion; si no, toma el texto visible del body.
+    Best-effort: ante cualquier fallo devuelve cadena vacia (no rompe la alerta).
+    """
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "alertas-m365"})
+        r.raise_for_status()
+        html = r.text
+        m = re.search(
+            r'<meta[^>]+(?:name|property)=["\'](?:og:)?description["\'][^>]+content=["\']([^"\']+)',
+            html, re.IGNORECASE,
+        )
+        if m and len(clean(m.group(1))) >= 40:
+            return clean(m.group(1))[:limit]
+        body = re.search(r"(?is)<body[^>]*>(.*)</body>", html)
+        text = strip_html(body.group(1) if body else html)
+        return text[:limit]
+    except Exception as exc:  # noqa: BLE001
+        print(f"No se pudo leer la pagina del incidente {url}: {exc}", flush=True)
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -280,9 +309,10 @@ def compose(service, effective_status, info, prev, reminder=False, category="ser
         f"🕐 Hora Ecuador: {now_ec()} (UTC-5)",
     ]
     lines.append(f"📋 Corresponde a: {info['title'] or 'revise el detalle en la página oficial.'}")
+    if info.get("excerpt"):
+        lines.append(f"📝 De qué se trata: {info['excerpt'][:600]}")
     if info["last_update_ec"]:
-        summary = info["excerpt"][:300]
-        lines.append(f"🕔 Última actualización oficial: {info['last_update_ec']} hora Ecuador (UTC-5) — {summary}")
+        lines.append(f"🕔 Última actualización oficial: {info['last_update_ec']} hora Ecuador (UTC-5)")
     else:
         lines.append("🕔 Última actualización oficial: ver detalle en la página oficial.")
     nxt = info["next_update_ec"]
@@ -376,7 +406,9 @@ def compose_feed(name, severity, category, title, summary, link, when_ec):
         f"📋 {clean(title)}",
     ]
     if summary:
-        lines.append(f"📝 {clean(summary)[:300]}")
+        lines.append(f"📝 De qué se trata: {clean(summary)[:700]}")
+    else:
+        lines.append("📝 De qué se trata: ver el detalle en la fuente.")
     if when_ec:
         lines.append(f"🕔 Publicado: {when_ec} hora Ecuador (UTC-5)")
     lines.append(f"🔗 Fuente: {link}")
@@ -394,8 +426,13 @@ def process_feed(urls, name, state, send):
         if eid in seen:
             continue
         title = entry.get("title", "")
-        summary = entry.get("summary", "") or entry.get("description", "")
+        summary = strip_html(entry.get("summary", "") or entry.get("description", ""))
         link = entry.get("link", "") or urls[0]
+        # Si la descripcion del feed viene corta, lee la pagina del incidente.
+        if len(summary) < 80 and link.startswith("http"):
+            page_text = fetch_page_text(link)
+            if len(page_text) > len(summary):
+                summary = page_text
         severity, category = classify_event(title, summary)
         when_ec = entry_time_ec(entry)
         msg = compose_feed(name, severity, category, title, summary, link, when_ec)
@@ -513,8 +550,23 @@ def main():
             "Mensaje de prueba del monitoreo automático (GitHub Actions). "
             "Fuentes: página oficial, RSS de Azure Status, RSS de M365 admin "
             "center" + (" y Microsoft Graph (tenant)" if graph_enabled() else "") + ". "
-            "Las alertas reales llegan solo cuando hay una novedad."
+            "Las alertas reales llegan solo cuando hay una novedad, con el detalle "
+            "de qué se trata y el enlace a la fuente."
         )
+        # Muestra, como ejemplo, el ultimo incidente real publicado en Azure.
+        parsed = fetch_feed(AZURE_RSS)
+        if parsed and parsed.entries:
+            e = parsed.entries[0]
+            title = e.get("title", "")
+            summary = strip_html(e.get("summary", "") or e.get("description", ""))
+            link = e.get("link", "") or AZURE_RSS[0]
+            if len(summary) < 80 and link.startswith("http"):
+                pt = fetch_page_text(link)
+                if len(pt) > len(summary):
+                    summary = pt
+            sev, cat = classify_event(title, summary)
+            sample = compose_feed("MICROSOFT AZURE (EJEMPLO)", sev, cat, title, summary, link, entry_time_ec(e))
+            send_telegram("🔎 Ejemplo del formato con el último incidente publicado en Azure Status:\n\n" + sample)
         print("Prueba enviada. state.json no se modificó.")
         return 0
 
