@@ -572,7 +572,8 @@ def main():
             "Las alertas reales llegan solo cuando hay una novedad, con el detalle "
             "de qué se trata y el enlace a la fuente."
         )
-        # Muestra, como ejemplo, el ultimo incidente real publicado en Azure.
+        # Muestra el formato real de una alerta. Si hay un incidente publicado
+        # en Azure, usa ese; si no, envia un SIMULACRO claramente etiquetado.
         parsed = fetch_feed(AZURE_RSS)
         if parsed and parsed.entries:
             e = parsed.entries[0]
@@ -585,7 +586,23 @@ def main():
                     summary = pt
             sev, cat = classify_event(title, summary)
             sample = compose_feed("MICROSOFT AZURE (EJEMPLO)", sev, cat, title, summary, link, entry_time_ec(e))
-            send_telegram("🔎 Ejemplo del formato con el último incidente publicado en Azure Status:\n\n" + sample)
+            send_telegram("🔎 Ejemplo con el último incidente publicado en Azure Status:\n\n" + sample)
+        else:
+            demo_title = "Virtual Machines - East US 2 - Degradación del servicio (SIMULACRO)"
+            demo_summary = (
+                "A partir de las 16:40 UTC, un subconjunto de clientes puede experimentar "
+                "latencia y fallos intermitentes al conectarse a Virtual Machines y Storage "
+                "en la región East US 2. La causa probable es un dispositivo de red; los "
+                "ingenieros están redirigiendo el tráfico. Próxima actualización en 60 min."
+            )
+            sev, cat = classify_event(demo_title, demo_summary)
+            sample = compose_feed(
+                "MICROSOFT AZURE (SIMULACRO)", sev, cat, demo_title, demo_summary,
+                "https://status.cloud.microsoft/", entry_time_ec({}) or None,
+            )
+            send_telegram(
+                "🧪 SIMULACRO — así se ve una alerta real (no es un incidente real):\n\n" + sample
+            )
         print("Prueba enviada. state.json no se modificó.")
         return 0
 
