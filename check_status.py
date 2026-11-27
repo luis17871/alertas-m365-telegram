@@ -532,7 +532,7 @@ def compose_down(name, url, grp, effective, detail, reminder):
         f"🕐 Hora Ecuador: {now_ec()} (UTC-5)",
         f"📋 Endpoint: {url}",
         f"📝 Resultado del sondeo: {detail}",
-        "🔗 Verifica: https://status.cloud.microsoft/ · https://downdetector.com/",
+        "🔗 Verifica: https://status.cloud.microsoft/",
     ]
     return "\n".join(lines)
 

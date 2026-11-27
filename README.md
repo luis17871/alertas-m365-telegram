@@ -26,9 +26,8 @@ GitHub Actions.
    min, y envía **RESTABLECIDO** al volver. Es una verificación propia, rápida e
    independiente de la página de estado.
 
-   > Nota: Downdetector no se consume directamente porque no ofrece API pública
-   > gratuita y está protegido por Cloudflare; esta fuente 5 cumple el mismo
-   > objetivo (detectar caídas de los servicios Microsoft) de forma legítima.
+   > Downdetector se descartó por no ser confiable (sin API pública, protegido
+   > por Cloudflare). La detección por sondeo cumple el mismo objetivo.
 
 Las fuentes de eventos (RSS/Graph) **deduplican por id**: cada incidente se
 alerta una sola vez.
