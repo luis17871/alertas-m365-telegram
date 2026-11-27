@@ -24,5 +24,25 @@
   },
   "seen": [
     "5304e103baa2718c"
-  ]
+  ],
+  "endpoints": {
+    "Entra ID / Login": {
+      "status": "up"
+    },
+    "Exchange Online": {
+      "status": "up"
+    },
+    "Microsoft Graph": {
+      "status": "up"
+    },
+    "Teams": {
+      "status": "up"
+    },
+    "Portal de Azure": {
+      "status": "up"
+    },
+    "Azure Resource Manager": {
+      "status": "up"
+    }
+  }
 }
