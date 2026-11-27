@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -79,6 +80,20 @@ GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", "")
 
 ACTIVE_STATUSES = ("interruption", "degradation", "incident")
 SEEN_MAX = 300  # ids recordados para no repetir alertas de eventos (RSS/Graph)
+
+# Deteccion de caidas por sondeo directo (estilo "down detector" propio):
+# endpoints publicos de los servicios Microsoft que usa la empresa. Un endpoint
+# cuenta como ARRIBA si responde cualquier codigo < 500 (incluye 401/403/redirect,
+# que significan "esta vivo"); cuenta como CAIDO ante error de conexion, timeout
+# o 5xx, confirmado con reintentos.
+ENDPOINTS = [
+    ("Entra ID / Login", "https://login.microsoftonline.com/", "m365"),
+    ("Exchange Online", "https://outlook.office365.com/", "m365"),
+    ("Microsoft Graph", "https://graph.microsoft.com/", "m365"),
+    ("Teams", "https://teams.microsoft.com/", "m365"),
+    ("Portal de Azure", "https://portal.azure.com/", "azure"),
+    ("Azure Resource Manager", "https://management.azure.com/", "azure"),
+]
 
 MONTHS = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
@@ -484,6 +499,82 @@ def graph_token():
     return r.json()["access_token"]
 
 
+def check_endpoint(url):
+    """Devuelve (arriba, detalle). Reintenta hasta 3 veces antes de declarar caida."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    }
+    detail = ""
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=15, headers=headers, allow_redirects=True)
+            if r.status_code < 500:
+                return True, f"HTTP {r.status_code}"
+            detail = f"HTTP {r.status_code}"
+        except Exception as exc:  # noqa: BLE001
+            detail = type(exc).__name__
+        if attempt < 2:
+            time.sleep(2)
+    return False, detail or "sin respuesta"
+
+
+def compose_down(name, url, grp, effective, detail, reminder):
+    svc = "MICROSOFT 365" if grp == "m365" else "MICROSOFT AZURE"
+    if effective == "restored":
+        head = f"🟢 RESTABLECIDO — {svc} — {name}"
+    else:
+        label = "EL SERVICIO SIGUE CAÍDO" if reminder else "CAÍDA DETECTADA"
+        head = f"🔴 {label} — {svc} — {name}"
+    lines = [
+        head,
+        "🏷 Categoría: 🔧 Servicio (detección por sondeo)",
+        f"🕐 Hora Ecuador: {now_ec()} (UTC-5)",
+        f"📋 Endpoint: {url}",
+        f"📝 Resultado del sondeo: {detail}",
+        "🔗 Verifica: https://status.cloud.microsoft/ · https://downdetector.com/",
+    ]
+    return "\n".join(lines)
+
+
+def process_endpoints(state, send, now_epoch):
+    """Sondea los endpoints y alerta en la transicion arriba->caido y caido->arriba.
+
+    Mantiene el estado por endpoint (maquina de estados) y reenvia "sigue caido"
+    cada RECORDAR_MIN minutos mientras persista. Devuelve True si cambio el estado.
+    """
+    eps = state.setdefault("endpoints", {})
+    changed = False
+    for name, url, grp in ENDPOINTS:
+        up, detail = check_endpoint(url)
+        cur = "up" if up else "down"
+        prev = eps.get(name, {})
+        prev_status = prev.get("status")
+        print(f"endpoint {name}: {cur} ({detail})", flush=True)
+
+        send_now = False
+        effective = None
+        reminder = False
+        if prev_status is None:  # primera vez
+            if cur == "down":
+                send_now, effective = True, "down"
+        elif cur != prev_status:
+            send_now = True
+            effective = "restored" if cur == "up" else "down"
+        elif cur == "down":
+            if now_epoch - prev.get("last_alert_epoch", 0) >= RECORDAR_MIN * 60:
+                send_now, effective, reminder = True, "down", True
+
+        if send_now:
+            send(compose_down(name, url, grp, effective, detail, reminder))
+            eps[name] = {"status": cur, "last_alert_epoch": now_epoch}
+            changed = True
+        elif prev_status != cur:
+            eps[name] = {**prev, "status": cur}
+            changed = True
+    return changed
+
+
 def process_graph(state, send):
     """Incidentes de servicio y avisos del Centro de mensajes del tenant.
 
@@ -650,6 +741,11 @@ def main():
 
     # Fuente 4: Graph (solo si hay credenciales).
     process_graph(state, send_telegram)
+
+    # Fuente 5: deteccion de caidas por sondeo directo de endpoints.
+    now_epoch2 = int(datetime.now(timezone.utc).timestamp())
+    if process_endpoints(state, send_telegram, now_epoch2):
+        changed = True
 
     if len(state["seen"]) != before:
         changed = True

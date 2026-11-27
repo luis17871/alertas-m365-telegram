@@ -18,6 +18,17 @@ GitHub Actions.
    brecha tipo Entra Connect Health, que **no** aparece en páginas públicas).
    Se activa solo al cargar los secretos `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`
    y `GRAPH_CLIENT_SECRET` (ver abajo). Sin ellos, este bloque no corre.
+5. **Detección de caídas por sondeo** — sondea endpoints públicos de los
+   servicios Microsoft que usa la empresa (Entra/Login, Exchange Online, Graph,
+   Teams, Portal de Azure, Azure Resource Manager). Si un endpoint no responde,
+   da timeout o devuelve 5xx (confirmado con reintentos), avisa **CAÍDA
+   DETECTADA**; mientras persista reenvía **sigue caído** cada `RECORDAR_MIN`
+   min, y envía **RESTABLECIDO** al volver. Es una verificación propia, rápida e
+   independiente de la página de estado.
+
+   > Nota: Downdetector no se consume directamente porque no ofrece API pública
+   > gratuita y está protegido por Cloudflare; esta fuente 5 cumple el mismo
+   > objetivo (detectar caídas de los servicios Microsoft) de forma legítima.
 
 Las fuentes de eventos (RSS/Graph) **deduplican por id**: cada incidente se
 alerta una sola vez.
